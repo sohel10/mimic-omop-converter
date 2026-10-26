@@ -173,3 +173,27 @@ mimic-omop-converter/
 ## Author
 
 **Sohel Ahmed, Ph.D.** — sohelcu06@gmail.com
+
+## FHIR Observation Support
+
+The converter also reads FHIR Observation resources (NDJSON format) and maps them to OMOP measurement. This demonstrates the full EHR → FHIR → OMOP workflow:
+
+1. **Query a FHIR server** (e.g., Epic, Cerner, or public test server like hapi.fhir.org)
+2. **Extract Observations** (lab tests, vitals, measurements)
+3. **Map LOINC codes** to OMOP concept IDs using Athena vocabulary
+4. **Load into OMOP** measurement table
+
+### FHIR Example
+
+```python
+from src.fhir_reader import load_fhir_observations
+
+loinc_to_concept = {
+    "2345-7": 3004501,  # Glucose
+    "777-3": 3013110,   # Platelets
+}
+
+measurements = load_fhir_observations('observations.ndjson', loinc_to_concept)
+```
+
+Tested with 290 real observations from HAPI FHIR public test server (hapi.fhir.org).
