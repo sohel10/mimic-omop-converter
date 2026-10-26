@@ -7,3 +7,4 @@ env/
 .idea/
 data/output/*.db
 data/mappings/*.csv
+data/output/*.db
