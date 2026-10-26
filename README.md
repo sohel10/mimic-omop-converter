@@ -2,101 +2,174 @@
 
 A PySpark-based ETL pipeline that converts MIMIC-IV clinical data (364K patients, 158M lab events) into the OMOP Common Data Model v5.4, outputting a validated SQLite database.
 
-## Why This Exists
+## The Problem
 
-OMOP CDM is the standard data format used by OHDSI's network of 800+ healthcare institutions. Most EHR data—including MIMIC-IV—ships in proprietary schemas. This converter bridges that gap, enabling MIMIC-IV data to work with any OMOP-compatible analytics tool (ATLAS, ACHILLES, PatientLevelPrediction).
+MIMIC-IV stores ICU data in its own proprietary schema — patients, admissions, labevents, prescriptions — each with different column names and formats. OMOP CDM is the standard used by 800+ healthcare institutions worldwide (OHDSI network). Without conversion, MIMIC-IV data cannot be used with OMOP-compatible tools like ATLAS, ACHILLES, or PatientLevelPrediction.
 
-## Results
+**Challenge at scale:** 364,627 patients generate 158 million lab readings and 20 million prescriptions. Naive approaches (loading everything into pandas, filtering with SQL IN() clauses) crash on commodity hardware (32GB RAM).
 
-| OMOP Table | Rows | Source |
-|---|---|---|
-| person | 364,627 | patients.csv |
-| visit_occurrence | 546,028 | admissions.csv |
-| measurement | 16,588,459 | labevents.csv (aggregated from 158M raw rows) |
-| drug_exposure | 20,292,611 | prescriptions.csv |
+## The Solution
 
-**Output:** 4.7 GB SQLite database, zero orphan foreign keys, zero null primary keys.
+A four-stage PySpark pipeline that handles the full dataset on a single machine:
 
-## Architecture
+```mermaid
+flowchart LR
+    subgraph EXTRACT
+        A[patients.csv\n364K rows] --> E[Spark Reader\n+ Broadcast Join]
+        B[admissions.csv\n546K rows] --> E
+        C[labevents.csv\n158M rows] --> E
+        D[prescriptions.csv\n20M rows] --> E
+    end
 
-### Pipeline Steps
+    subgraph TRANSFORM
+        E --> F[OMOP Mapper]
+        F --> G[person\n364K]
+        F --> H[visit_occurrence\n546K]
+        C2[Lab Aggregation\ngroupBy patient+test\n158M → 16.5M] --> I[measurement\n16.5M]
+        F --> C2
+        F --> J[drug_exposure\n20.3M]
+    end
 
-1. **Load** - Spark reads compressed CSVs with schema inference
-2. **Filter** - Broadcast join against patient ID list (replaces .isin() which caused JVM code-gen OOM with 364K IDs)
-3. **Aggregate** - Lab events grouped by (patient_id, itemid), computing mean/max/min per patient per lab test
-4. **Map** - MIMIC columns renamed and cast to OMOP CDM v5.4 schema with vocabulary concept IDs
-5. **Write** - Streamed to SQLite in 500K-row batches via toLocalIterator() (avoids collecting 37M rows into pandas)
+    subgraph LOAD
+        G --> K[(omop.db\nSQLite\n4.7 GB)]
+        H --> K
+        I --> K
+        J --> K
+    end
 
-### Engineering Decisions
+    style C2 fill:#059669,color:#fff
+    style K fill:#2563eb,color:#fff
+```
 
-**Broadcast join over .isin():** Passing 364,627 patient IDs to Spark's .isin() generates a single IN() predicate that overflows the JVM code generator. Broadcasting the patient ID DataFrame as a small lookup table eliminates this.
+## Engineering Problems and Fixes
 
-**Lab aggregation:** 158M individual lab readings aggregated to 16.5M summary rows (mean, max, min per patient per lab test), preserving clinical signal while reducing data volume 10x.
+| # | Problem | Root Cause | Fix | Result |
+|---|---------|-----------|-----|--------|
+| 1 | `.isin(364K IDs)` crashes JVM | Spark generates a single SQL IN() with 364,627 elements, overflowing the code generator | **Broadcast join** — replicate 3MB patient ID table to each executor | No OOM, sub-second filter |
+| 2 | `toPandas()` kills process | Collecting 37M rows into pandas exceeds 32GB RAM | **`toLocalIterator()`** — stream rows in 500K batches to SQLite | Peak memory ~2GB |
+| 3 | `row_number()` shuffles all data to one partition | `Window.orderBy()` without `partitionBy()` forces global sort | **`monotonically_increasing_id()`** — each partition gets its own ID range | No data movement |
+| 4 | 158M lab rows too large for downstream analysis | One patient x 30 days x 15 tests = 450 rows each | **groupBy(patient, test)** — aggregate to mean/max/min per patient per test | 158M → 16.5M rows |
+| 5 | Crash at step 4 loses 3 hours of work | No checkpointing | **Resume logic** — skip tables that already have data in SQLite | Re-run picks up where it stopped |
 
-**Chunked SQLite writes:** toPandas() on 20M+ rows exceeds driver memory. toLocalIterator() streams rows one partition at a time, writing 500K-row batches. DataFrames repartitioned to 20 partitions to stay under maxResultSize (4GB).
+## OMOP Schema Mapping
 
-**Resume logic:** Converter checks each table's row count before writing, allowing safe re-runs after interruptions.
+### Source (MIMIC-IV) → Target (OMOP CDM v5.4)
+``` patients.csv → person
+subject_id → person_id (direct)
+gender (M/F) → gender_concept_id (M=8507, F=8532)
+anchor_age → year_of_birth
+
+admissions.csv → visit_occurrence
+hadm_id → visit_occurrence_id (direct)
+subject_id → person_id (FK)
+admittime / dischtime → visit_start/end_datetime
+(all admissions) → visit_concept_id = 9201 (Inpatient)
+
+labevents.csv → measurement (AGGREGATED)
+subject_id + itemid → groupBy keys
+avg(valuenum) → value_as_number
+max(valuenum) → value_max
+min(valuenum) → value_min
+count(*) → num_observations
+itemid → measurement_concept_id (LOINC mapped)
+
+prescriptions.csv → drug_exposure
+subject_id → person_id (FK)
+drug → drug_source_value (text preserved)
+starttime / stoptime → drug_exposure_start/end_date
+drug_concept_id → 0 (RxNorm mapping not yet implemented)
+```
+
+### LOINC Vocabulary Mapping
+
+| MIMIC itemid | Lab Test | OMOP Concept ID | Standard |
+|---|---|---|---|
+| 50862 | Sodium | 3024561 | LOINC |
+| 50861 | Potassium | 3024560 | LOINC |
+| 50912 | Creatinine | 3018677 | LOINC |
+| 50893 | Calcium | 3008480 | LOINC |
+| 50889 | Troponin T | 3022192 | LOINC |
+| 50809 | Glucose | 3007637 | LOINC |
+| 50868 | Alkaline Phosphatase | 3027314 | LOINC |
+| 50883 | Bilirubin | 3023181 | LOINC |
+
+## Validation Results
+```person: 364,627
+visit_occurrence: 546,028
+measurement: 16,588,459
+drug_exposure: 20,292,611
+─────────────────────────────
+total rows: 37,791,725
+database size: 4,774 MB
+
+null person_id: 0 ✓
+null measurement values: 0 ✓
+orphan foreign keys: 0 ✓
+gender mapping coverage: 100% ```
 
 ## Spark Configuration
 
-| Setting | Value | Reason |
+| Setting | Value | Why |
 |---|---|---|
-| spark.driver.memory | 16g | Handles broadcast of 364K patient IDs |
-| spark.executor.memory | 8g | Per-executor allocation |
-| spark.sql.shuffle.partitions | 200 | Balances parallelism on single machine |
-| spark.sql.autoBroadcastJoinThreshold | 50m | Ensures patient ID table is broadcast |
-| spark.driver.maxResultSize | 4g | Accommodates large partition results |
-
-## OMOP Mappings
-
-| MIMIC Field | OMOP Field | Mapping |
-|---|---|---|
-| gender (M/F) | gender_concept_id | M=8507, F=8532 |
-| subject_id | person_id | Direct |
-| hadm_id | visit_occurrence_id | Direct |
-| itemid | measurement_concept_id | LOINC mapping (12 common labs) |
-| drug | drug_source_value | Preserved as source text |
-
-### LOINC Vocabulary (Partial)
-
-| MIMIC itemid | Lab Test | OMOP Concept ID |
-|---|---|---|
-| 50862 | Sodium | 3024561 |
-| 50861 | Potassium | 3024560 |
-| 50912 | Creatinine | 3018677 |
-| 50893 | Calcium | 3008480 |
-| 50889 | Troponin T | 3022192 |
-| 50809 | Glucose | 3007637 |
-
-### Not Yet Mapped
-
-- **RxNorm:** drug_concept_id set to 0 (requires NLM RxNorm API)
-- **SNOMED:** No ICD-10 condition mapping yet
-- **Race/ethnicity:** Set to 0 (not in MIMIC-IV patients.csv)
+| `spark.driver.memory` | 16g | Broadcast 364K patient IDs |
+| `spark.executor.memory` | 8g | Per-executor allocation |
+| `spark.sql.shuffle.partitions` | 200 | Parallelism on single machine |
+| `spark.sql.autoBroadcastJoinThreshold` | 50m | Force broadcast of patient ID table |
+| `spark.driver.maxResultSize` | 4g | Handle large partition results in toLocalIterator |
 
 ## Quick Start
+
+```bash
+# Setup
 conda create -n mimic-spark python=3.10
 conda activate mimic-spark
 pip install pyspark pandas
+
+# Run (requires MIMIC-IV data from PhysioNet)
 python convert.py /path/to/mimic-iv/data 364627 data/output
 
+# Validate
+python -c "
+import sqlite3
+conn = sqlite3.connect('data/output/omop.db')
+c = conn.cursor()
+for t in ['person','visit_occurrence','measurement','drug_exposure']:
+    c.execute(f'SELECT COUNT(*) FROM {t}')
+    print(f'{t}: {c.fetchone()[0]:,}')
+conn.close()
+"
+```
+
 ## Project Structure
+``` text
 mimic-omop-converter/
-convert.py # CLI entry point
-src/
-mimic_reader.py # Spark CSV loader with broadcast join
-omop_mapper.py # MIMIC to OMOP transformations
-vocabulary.py # LOINC/RxNorm/SNOMED concept mappings
-loader.py # Chunked SQLite writer
-config/
-omop_schema.sql # OMOP CDM v5.4 DDL
+├── convert.py # CLI entry point with Spark config and resume logic
+├── src/
+│ ├── mimic_reader.py # Spark CSV loader with broadcast join
+│ ├── omop_mapper.py # MIMIC → OMOP transformations + lab aggregation
+│ ├── vocabulary.py # LOINC/RxNorm/SNOMED concept ID mappings
+│ └── loader.py # Chunked SQLite writer (toLocalIterator + 500K batches)
+├── config/
+│ └── omop_schema.sql # OMOP CDM v5.4 DDL
+└── data/
+└── output/ # Generated omop.db (gitign
+```
+
+## Future Work
+
+- Full RxNorm drug mapping via NLM API
+- ICD-10 → SNOMED condition_occurrence table
+- Procedure mapping (procedures_icd → procedure_occurrence)
+- Data quality report (ACHILLES-style profiling)
+- PostgreSQL output option
 
 ## References
 
 - [OHDSI OMOP CDM v5.4](https://ohdsi.github.io/CommonDataModel/)
 - [MIMIC-IV Documentation](https://mimic.mit.edu/)
 - [The Book of OHDSI](https://ohdsi.github.io/TheBookOfOhdsi/)
+- [EHDEN Academy](https://academy.ehden.eu/)
 
 ## Author
 
-**Sohel Ahmed, Ph.D.** - sohelcu06@gmail.com
+**Sohel Ahmed, Ph.D.** — sohelcu06@gmail.com
